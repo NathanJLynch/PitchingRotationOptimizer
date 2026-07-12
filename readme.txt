@@ -1,12 +1,3 @@
-to run frontend:
-
-in frotend folder: npm run dev
-
-http://localhost:5173/
-
-http://localhost:8000/docs
-
-
 MAIN IDEA:
 
 Better pitchers should face better teams and division rivals. Rivalry weight changes based on position in the divison.
