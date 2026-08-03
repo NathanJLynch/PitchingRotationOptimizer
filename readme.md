@@ -259,8 +259,6 @@ Future versions may introduce roster checks that verify rosters before posting.
 
 ## Screenshots
 
-Add screenshots here once available.
-
 ### Rotation Output
 
 <img width="1102" height="723" alt="Screenshot 2026-08-03 173206" src="https://github.com/user-attachments/assets/1aa36dc3-e7c9-4e4f-b3d8-335f62c698a4" />
