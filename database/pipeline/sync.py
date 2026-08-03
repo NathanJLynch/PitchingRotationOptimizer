@@ -171,17 +171,17 @@ async def sync_all_async(session_factory, our_team_db_id: Optional[int] = None):
         logger.error(f"Async fetch phase failed entirely: {e}")
         fetched = {
             "standings": [], "schedule": [], "game_starts": [],
-            "pitcher_stats": [], "team_stats": [], "new_pitchers": [],
+            "pitcher_stats": [], "team_stats": [], "rosters": [],
         }
 
     # Phase 3: write — isolated sessions so one failure can't poison others
     for label, fn, key in [
-        ("Roster upsert", _write_new_pitchers, "new_pitchers"),
-        ("Standings",     _write_standings,    "standings"),
-        ("Schedule",      _write_schedule,     "schedule"),
-        ("Game starts",   _write_game_starts,  "game_starts"),
-        ("Pitcher stats", _write_pitcher_stats,"pitcher_stats"),
-        ("Team stats",    _write_team_stats,   "team_stats"),
+        ("Roster reconcile", _reconcile_rosters, "rosters"),
+        ("Standings",        _write_standings,   "standings"),
+        ("Schedule",         _write_schedule,    "schedule"),
+        ("Game starts",      _write_game_starts, "game_starts"),
+        ("Pitcher stats",    _write_pitcher_stats, "pitcher_stats"),
+        ("Team stats",       _write_team_stats,  "team_stats"),
     ]:
         try:
             with get_db_session(session_factory) as db:
@@ -349,15 +349,17 @@ async def _fetch_everything(
                 continue
             starters.extend(result)
 
-        # New pitchers — in roster results but not yet in DB
+        # Fetch detail stats for pitchers not yet in the DB.
+        # We only need this for new pitchers — existing rows already
+        # have stats that _write_pitcher_stats will update via Statcast.
         new_candidates = [
             p for p in raw_rosters
             if p["mlb_player_id"] not in known_mlb_player_ids
         ]
 
-        new_pitcher_details = {}
+        new_pitcher_details: dict[int, dict] = {}
         if new_candidates:
-            logger.info(f"Roster upsert: {len(new_candidates)} new pitchers found, fetching stats...")
+            logger.info(f"Roster reconcile: {len(new_candidates)} new pitchers found, fetching stats...")
             detail_results = await asyncio.gather(
                 *[_fetch_pitcher_detail(client, mlb_sem, p) for p in new_candidates],
                 return_exceptions=True,
@@ -369,16 +371,20 @@ async def _fetch_everything(
                 else:
                     new_pitcher_details[p["mlb_player_id"]] = result
 
+    # Attach detail dict to every roster entry (empty for existing pitchers).
+    # _reconcile_rosters uses it only when inserting a new row.
+    rosters_with_detail = [
+        {**p, "detail": new_pitcher_details.get(p["mlb_player_id"], {})}
+        for p in raw_rosters
+    ]
+
     return {
         "standings":     standings_rows,
         "schedule":      schedule_games,
         "game_starts":   starters,
         "pitcher_stats": pitcher_stats,
         "team_stats":    team_stats,
-        "new_pitchers":  [
-            {**p, "detail": new_pitcher_details.get(p["mlb_player_id"], {})}
-            for p in new_candidates
-        ],
+        "rosters":       rosters_with_detail,
     }
 
 
@@ -408,7 +414,12 @@ async def _get_json(
 
 
 # ─────────────────────────────────────────────────────────────
-# ROSTER FETCH — detect new starters each sync
+# ROSTER FETCH
+#
+# Returns ALL pitchers on each team's active roster, not just
+# starters. _reconcile_rosters uses _qualifies_as_starter to
+# set is_starter correctly, and uses the full list to detect
+# who has left the roster entirely (trades, releases, IL).
 # ─────────────────────────────────────────────────────────────
 
 async def _gather_rosters(client, sem, all_mlb_ids: list[int]) -> list[dict]:
@@ -426,13 +437,19 @@ async def _gather_rosters(client, sem, all_mlb_ids: list[int]) -> list[dict]:
 
 
 async def _fetch_roster_async(client, sem, mlb_team_id: int) -> list[dict]:
+    """
+    Returns all pitchers on the active roster for a team.
+    Starter eligibility is determined later in _reconcile_rosters
+    so that players who move to the bullpen get is_starter=False
+    rather than being silently deactivated.
+    """
     url = (
         f"https://statsapi.mlb.com/api/v1/teams/{mlb_team_id}/roster"
         f"?rosterType=active&season={date.today().year}"
         f"&hydrate=person(stats(type=season,group=pitching))"
     )
     data = await _get_json(client, sem, url)
-    candidates = []
+    pitchers = []
     for entry in data.get("roster", []):
         if entry.get("position", {}).get("abbreviation") != "P":
             continue
@@ -449,21 +466,24 @@ async def _fetch_roster_async(client, sem, mlb_team_id: int) -> list[dict]:
         gs = int(season_stats.get("gamesStarted", 0))
         gp = int(season_stats.get("gamesPitched", 0)) or gs
         ip = _parse_ip(season_stats.get("inningsPitched", "0"))
+        bf = int(season_stats.get("battersFaced", max(int(ip * 4), 1)))
 
-        if _qualifies_as_starter(gs, gp, ip):
-            bf = int(season_stats.get("battersFaced", max(int(ip * 4), 1)))
-            candidates.append({
-                "mlb_player_id": person["id"],
-                "name":          person.get("fullName", str(person["id"])),
-                "throws":        person.get("pitchHand", {}).get("code", "R"),
-                "team_mlb_id":   mlb_team_id,
-                "games_started": gs,
-                "ip":            ip,
-                "strikeouts":    int(season_stats.get("strikeOuts", 0)),
-                "walks":         int(season_stats.get("baseOnBalls", 0)),
-                "batters_faced": bf,
-            })
-    return candidates
+        pitchers.append({
+            "mlb_player_id": person["id"],
+            "name":          person.get("fullName", str(person["id"])),
+            "throws":        person.get("pitchHand", {}).get("code", "R"),
+            "team_mlb_id":   mlb_team_id,
+            "games_started": gs,
+            "ip":            ip,
+            "strikeouts":    int(season_stats.get("strikeOuts", 0)),
+            "walks":         int(season_stats.get("baseOnBalls", 0)),
+            "batters_faced": bf,
+            "gp":            gp,
+            # Starter flag resolved here so _reconcile_rosters can
+            # update is_starter without re-running the eligibility math.
+            "is_starter":    _qualifies_as_starter(gs, gp, ip),
+        })
+    return pitchers
 
 
 async def _fetch_pitcher_detail(client, sem, p: dict) -> dict:
@@ -491,61 +511,133 @@ async def _fetch_pitcher_detail(client, sem, p: dict) -> dict:
     }
 
 
-def _write_new_pitchers(db, new_pitchers: list[dict] | None):
-    if not new_pitchers:
+# ─────────────────────────────────────────────────────────────
+# ROSTER RECONCILE
+#
+# Runs every sync. Compares the full current MLB active roster
+# snapshot against DB state and:
+#   - Inserts new pitchers (never seen before)
+#   - Updates team_id on trades
+#   - Updates is_starter when a pitcher moves to/from the bullpen
+#   - Reactivates pitchers who return from IL or minors
+#   - Deactivates pitchers no longer on any active roster
+#
+# Never deletes rows — all GameStart, fatigue, and optimizer
+# history is preserved and linked by pitcher.id.
+# ─────────────────────────────────────────────────────────────
+
+def _reconcile_rosters(db, roster_candidates: list[dict] | None):
+    if not roster_candidates:
         return
-    today    = date.today()
-    existing = {p.mlb_player_id for p in db.query(Pitcher).all()}
-    inserted = 0
-    for p in new_pitchers:
-        if p["mlb_player_id"] in existing:
-            continue
-        db_team_id = MLB_TO_DB_TEAM.get(p["team_mlb_id"])
+
+    today = date.today()
+
+    # Build lookup of all DB pitchers by mlb_player_id
+    all_pitchers = {p.mlb_player_id: p for p in db.query(Pitcher).all()}
+
+    # Set of mlb_player_ids currently on an active MLB roster
+    active_mlb_ids = {p["mlb_player_id"] for p in roster_candidates}
+
+    # ── Deactivate pitchers no longer on any active roster ─────
+    deactivated = 0
+    for mlb_id, pitcher in all_pitchers.items():
+        if pitcher.is_active and mlb_id not in active_mlb_ids:
+            pitcher.is_active  = False
+            pitcher.is_starter = False
+            logger.info(f"  Deactivated: {pitcher.name} (no longer on active roster)")
+            deactivated += 1
+
+    # ── Insert or update ───────────────────────────────────────
+    inserted = updated = 0
+    for candidate in roster_candidates:
+        mlb_id     = candidate["mlb_player_id"]
+        db_team_id = MLB_TO_DB_TEAM.get(candidate["team_mlb_id"])
         if db_team_id is None:
             continue
-        detail = p.get("detail", {})
-        ops    = detail.get("ops_allowed") or LEAGUE_AVG_PITCHER["ops_allowed"]
-        pitcher = Pitcher(
-            mlb_player_id      = p["mlb_player_id"],
-            name               = p["name"],
-            team_id            = db_team_id,
-            throws             = p["throws"],
-            is_starter         = True,
-            is_active          = True,
-            stats_as_of        = today,
-            era                = detail.get("era", 4.50),
-            k_pct              = detail.get("k_pct")  or LEAGUE_AVG_PITCHER["k_pct"],
-            bb_pct             = detail.get("bb_pct") or LEAGUE_AVG_PITCHER["bb_pct"],
-            k_pct_60d          = detail.get("k_pct")  or LEAGUE_AVG_PITCHER["k_pct"],
-            bb_pct_60d         = detail.get("bb_pct") or LEAGUE_AVG_PITCHER["bb_pct"],
-            ops_allowed        = ops,
-            ops_allowed_60d    = ops,
-            ops_allowed_vs_rhb = ops - 0.020,
-            ops_allowed_vs_lhb = (ops + 0.025) if p["throws"] == "R" else (ops - 0.010),
-            woba_allowed       = LEAGUE_AVG_PITCHER["woba_allowed"],
-            fip                = LEAGUE_AVG_PITCHER["fip"],
-            xfip               = LEAGUE_AVG_PITCHER["xfip"],
-            xfip_60d           = LEAGUE_AVG_PITCHER["xfip"],
-            fb_velo            = LEAGUE_AVG_PITCHER["fb_velo"],
-            spin_rate          = LEAGUE_AVG_PITCHER["spin_rate"],
-            extension          = LEAGUE_AVG_PITCHER["extension"],
-            whiff_pct          = LEAGUE_AVG_PITCHER["whiff_pct"],
-            zone_pct           = LEAGUE_AVG_PITCHER["zone_pct"],
-            chase_pct          = LEAGUE_AVG_PITCHER["chase_pct"],
-            fastball_usage     = LEAGUE_AVG_PITCHER["fastball_usage"],
-            breaking_usage     = LEAGUE_AVG_PITCHER["breaking_usage"],
-            offspeed_usage     = LEAGUE_AVG_PITCHER["offspeed_usage"],
-            hard_hit_pct       = LEAGUE_AVG_PITCHER["hard_hit_pct"],
-            xwoba              = LEAGUE_AVG_PITCHER["xwoba"],
-        )
-        db.add(pitcher)
-        existing.add(p["mlb_player_id"])
-        inserted += 1
-        logger.info(f"  New starter added: {p['name']} ({p['games_started']} GS, {p['ip']/p['games_started']:.1f} IP/start)")
 
-    if inserted:
-        db.flush()
-        logger.info(f"Roster upsert: {inserted} new starters inserted.")
+        if mlb_id not in all_pitchers:
+            # Brand new pitcher — insert with league-average defaults
+            _insert_pitcher(db, candidate, db_team_id, today)
+            inserted += 1
+        else:
+            pitcher = all_pitchers[mlb_id]
+            changed = False
+
+            # Trade detected — update team
+            if pitcher.team_id != db_team_id:
+                logger.info(f"  Trade: {pitcher.name} → team_id {db_team_id}")
+                pitcher.team_id = db_team_id
+                changed = True
+
+            # Starter status changed (promoted, demoted, role change)
+            if pitcher.is_starter != candidate["is_starter"]:
+                pitcher.is_starter = candidate["is_starter"]
+                action = "promoted to starter" if candidate["is_starter"] else "moved to bullpen"
+                logger.info(f"  Role change: {pitcher.name} {action}")
+                changed = True
+
+            # Reactivate if previously marked inactive (returned from IL/minors)
+            if not pitcher.is_active:
+                pitcher.is_active = True
+                logger.info(f"  Reactivated: {pitcher.name}")
+                changed = True
+
+            if changed:
+                pitcher.stats_as_of = today
+                updated += 1
+
+    db.flush()
+    logger.info(
+        f"Roster reconcile: {inserted} inserted, {updated} updated, "
+        f"{deactivated} deactivated."
+    )
+
+
+def _insert_pitcher(db, p: dict, db_team_id: int, today: date):
+    """Insert a brand-new pitcher row with league-average stat defaults."""
+    detail = p.get("detail", {})
+    ops    = detail.get("ops_allowed") or LEAGUE_AVG_PITCHER["ops_allowed"]
+    pitcher = Pitcher(
+        mlb_player_id      = p["mlb_player_id"],
+        name               = p["name"],
+        team_id            = db_team_id,
+        throws             = p["throws"],
+        is_starter         = p["is_starter"],
+        is_active          = True,
+        stats_as_of        = today,
+        era                = min(float(detail.get("era") or 4.50), 14.99),
+        k_pct              = detail.get("k_pct")  or LEAGUE_AVG_PITCHER["k_pct"],
+        bb_pct             = detail.get("bb_pct") or LEAGUE_AVG_PITCHER["bb_pct"],
+        k_pct_60d          = detail.get("k_pct")  or LEAGUE_AVG_PITCHER["k_pct"],
+        bb_pct_60d         = detail.get("bb_pct") or LEAGUE_AVG_PITCHER["bb_pct"],
+        ops_allowed        = ops,
+        ops_allowed_60d    = ops,
+        ops_allowed_vs_rhb = ops - 0.020,
+        ops_allowed_vs_lhb = (ops + 0.025) if p["throws"] == "R" else (ops - 0.010),
+        woba_allowed       = LEAGUE_AVG_PITCHER["woba_allowed"],
+        fip                = LEAGUE_AVG_PITCHER["fip"],
+        xfip               = LEAGUE_AVG_PITCHER["xfip"],
+        xfip_60d           = LEAGUE_AVG_PITCHER["xfip"],
+        fb_velo            = LEAGUE_AVG_PITCHER["fb_velo"],
+        spin_rate          = LEAGUE_AVG_PITCHER["spin_rate"],
+        extension          = LEAGUE_AVG_PITCHER["extension"],
+        whiff_pct          = LEAGUE_AVG_PITCHER["whiff_pct"],
+        zone_pct           = LEAGUE_AVG_PITCHER["zone_pct"],
+        chase_pct          = LEAGUE_AVG_PITCHER["chase_pct"],
+        fastball_usage     = LEAGUE_AVG_PITCHER["fastball_usage"],
+        breaking_usage     = LEAGUE_AVG_PITCHER["breaking_usage"],
+        offspeed_usage     = LEAGUE_AVG_PITCHER["offspeed_usage"],
+        hard_hit_pct       = LEAGUE_AVG_PITCHER["hard_hit_pct"],
+        xwoba              = LEAGUE_AVG_PITCHER["xwoba"],
+    )
+    db.add(pitcher)
+    gs = p.get("games_started", 0)
+    ip = p.get("ip", 0.0)
+    logger.info(
+        f"  New pitcher: {p['name']} "
+        f"({'starter' if p['is_starter'] else 'reliever'}, "
+        f"{gs} GS, {ip:.1f} IP)"
+    )
 
 
 # ─────────────────────────────────────────────────────────────
