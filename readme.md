@@ -11,7 +11,6 @@ The project combines MLB statistical data, machine learning models, and dynamic 
 <img width="1102" height="723" alt="Screenshot 2026-08-03 173206" src="https://github.com/user-attachments/assets/0acf3879-f664-43e8-beca-d417f8a0ce5b" />
 
 
---
 
 ## Project Goal
 
