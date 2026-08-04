@@ -247,12 +247,6 @@ Some MLB teams temporarily lack enough healthy qualified starting pitchers to co
 
 Results generally improve as additional season data becomes available.
 
-### Trades and Releases
-
-Model currently does not know that a player has been traded or released, and will place them in active rotation until they leave the recent performances window.
-
-Future versions may introduce roster checks that verify rosters before posting. 
-
 
 ---
 
