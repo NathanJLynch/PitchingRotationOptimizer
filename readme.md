@@ -255,7 +255,7 @@ Results generally improve as additional season data becomes available.
 
 ### Rotation Output
 
-<img width="1102" height="723" alt="Screenshot 2026-08-03 173206" src="https://github.com/user-attachments/assets/1aa36dc3-e7c9-4e4f-b3d8-335f62c698a4" />
+<img width="1112" height="1068" alt="Screenshot 2026-08-05 072158" src="https://github.com/user-attachments/assets/c2745408-df64-4363-b827-d11e4f7bde5f" />
 
 
 ## Author
