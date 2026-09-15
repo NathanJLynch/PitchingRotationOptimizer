@@ -9,7 +9,7 @@ from optimizer.matchup_model  import compute_matchup_score, PitcherProfile, Oppo
 from optimizer.division_bonus import DivisionBonusCalculator, DivisionBonusResult
 from optimizer.fatigue_model  import fatigue_penalty, FatigueState
 from ml.predict               import PitcherScoringPredictor
-
+from optimizer.matchup_model import build_ml_weight_dict, MatchupWeights
 
 # ─────────────────────────────────────────────────────────────
 # DATA CONTRACTS
@@ -51,7 +51,7 @@ class OptimizationResult:
 # ─────────────────────────────────────────────────────────────
 
 FATIGUE_LEVELS   = 5    # 0 = just pitched → 4 = fully fresh
-MIN_REST_DAYS    = 4    # hard constraint: cannot start at fatigue < this many days rest
+MIN_REST_DAYS    = 2    # hard constraint: cannot start at fatigue < this many days rest
 NEG_INF          = -1e9
 
 
@@ -115,7 +115,7 @@ def fatigue_bucket_to_days(bucket: int) -> int:
 #   - everyone else's fatigue increments by days_gap (capped at 4)
 # ─────────────────────────────────────────────────────────────
 
-# Minimum fatigue bucket required to start (4 days rest = bucket 3)
+# Minimum fatigue bucket required to start (2 days rest = bucket 1)
 ELIGIBLE_BUCKET = min(MIN_REST_DAYS, FATIGUE_LEVELS - 1)
 
 
@@ -285,12 +285,8 @@ def solve(
                 team_id    = game.opponent_team_id,
                 db_session = db_session,
             )
-            ml_weight_dict = {
-                "whiff_weight":   ml_coeffs.k_score,
-                "ops_weight":     ml_coeffs.ops_score,
-                "platoon_weight": 0.15,
-                "arsenal_weight": 1.0 - ml_coeffs.confidence,
-            } if ml_coeffs is not None else None
+            ml_coeffs = predictor.predict(pitcher_id=pitcher.id, team_id=game.opponent_team_id, db_session=db_session)
+            ml_weight_dict = build_ml_weight_dict(ml_coeffs, base_weights=MatchupWeights())
             for f in range(FATIGUE_LEVELS):
                 score, breakdown = compute_score(
                     pitcher         = pitcher,

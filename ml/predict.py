@@ -54,11 +54,11 @@
 #             for pid in pitcher_ids
 #         }
 
-# ml/predict.py
 import os
 import joblib
 import numpy as np
 from dataclasses import dataclass
+
 
 @dataclass
 class ScoringCoefficients:
@@ -101,7 +101,7 @@ class PitcherScoringPredictor:
         return None
 
     def predict(self, pitcher_id: int, team_id: int, db_session) -> ScoringCoefficients:
-        if self.k_model is None:
+        if self.k_model is None or self.ops_model is None or self.wpa_model is None:
             return self._default_coefficients(pitcher_id, team_id, db_session)
 
         from ml.features import build_matchup_features

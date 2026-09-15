@@ -2,6 +2,7 @@
 import numpy as np
 from dataclasses import dataclass
 from typing import NamedTuple, Optional
+from ml.predict import ScoringCoefficients
 from optimizer.fatigue_model import FatigueState
 # ─────────────────────────────────────────────────────────────
 # DATA CONTRACTS
@@ -54,22 +55,48 @@ class MatchupWeights(NamedTuple):
     platoon:       float = 0.15
     arsenal:       float = 0.10
 
+def build_ml_weight_dict(
+    ml_coeffs: "ScoringCoefficients",
+    base_weights: MatchupWeights = MatchupWeights(),
+) -> dict:
+    """
+    Derive blend weights for compute_matchup_score from ML predictions,
+    governed by model confidence rather than reusing outcome scores as weights.
+
+    - confidence == 0  -> returns base_weights unchanged (ML fully distrusted)
+    - confidence == 1  -> whiff/ops split fully follows the model's relative
+                          emphasis (k_score vs ops_score) for this matchup
+    - platoon/arsenal are never touched: nothing in ScoringCoefficients
+      models those dimensions, so there's no ML signal to justify moving them
+    """
+    alpha = float(np.clip(ml_coeffs.confidence, 0.0, 1.0))
+
+    k_score, ops_score = ml_coeffs.k_score, ml_coeffs.ops_score
+    total = k_score + ops_score
+    if total > 1e-6:
+        whiff_share = k_score / total
+        ops_share   = ops_score / total
+    else:
+        # No signal either way -> don't redistribute
+        whiff_share, ops_share = 0.5, 0.5
+
+    static_budget = base_weights.whiff_compat + base_weights.ops_suppress
+    ml_whiff = whiff_share * static_budget
+    ml_ops   = ops_share   * static_budget
+
+    return {
+        "whiff_weight":   (1 - alpha) * base_weights.whiff_compat + alpha * ml_whiff,
+        "ops_weight":     (1 - alpha) * base_weights.ops_suppress + alpha * ml_ops,
+        "platoon_weight": base_weights.platoon,
+        "arsenal_weight": base_weights.arsenal,
+    }
 
 # ─────────────────────────────────────────────────────────────
 # 1. WHIFF COMPATIBILITY
 #
-# Core question: does the pitcher's swing-and-miss profile
-# match well (or poorly) against this team's tendency to whiff?
-#
 # Power pitchers (high whiff) should face high-whiff teams.
 # Contact pitchers (low whiff) should face low-whiff teams.
 #
-# This is NOT just subtraction. The shape matters:
-#   - A 35% whiff pitcher vs. a 30% whiff team = great
-#   - A 10% whiff pitcher vs. a 8% whiff team  = fine — it's
-#     a contact matchup that suits both profiles
-#   - A 10% whiff pitcher vs. a 30% whiff team = mismatch
-#     (contact pitcher leaving strikeouts on the table)
 # ─────────────────────────────────────────────────────────────
 
 def whiff_compatibility(pitcher: PitcherProfile, opponent: OpponentProfile) -> float:

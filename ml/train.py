@@ -19,16 +19,16 @@ from sklearn.model_selection import TimeSeriesSplit
 # Three models, three targets:
 #
 #   Model 1 (LightGBM): label_k_pct
-#     → predicts K% for this pitcher vs. this opponent
-#     → feeds into whiff/accuracy matchup dimension
+#   predicts K% for this pitcher vs. this opponent
+#   feeds into whiff/accuracy matchup dimension
 #
 #   Model 2 (XGBoost): label_ops_allowed
-#     → predicts OPS allowed for this matchup
-#     → feeds into the OPS dimension
+#   predicts OPS allowed for this matchup
+#   feeds into the OPS dimension
 #
 #   Model 3 (XGBoost): label_wpa
-#     → the "master" label: actual WPA from historical starts
-#     → used to validate and blend the sub-scores
+#   the "master" label: actual WPA from historical starts
+#   used to validate and blend the sub-scores
 # ─────────────────────────────────────────────
 
 # These must exactly match the column names produced by build_dataset.py
@@ -94,12 +94,6 @@ def train_all_models():
     print(f"Dropped {before - len(X)} rows with NaN features ({len(X)} remain)")
 
     os.makedirs(MODEL_DIR, exist_ok=True)
-
-    # ── Time-series cross-validation ──────────────────────────
-    # Data has temporal structure. Never shuffle baseball data —
-    # a model that sees 2023 games while predicting 2022 is cheating.
-    # gap=162 skips ~one season between train/test folds.
-    tscv = TimeSeriesSplit(n_splits=5, gap=162)
 
     # ── Model 1: K% predictor (LightGBM) ─────────────────────
     print("\n── Training K% model (LightGBM) ──")
